@@ -42,10 +42,9 @@ services:
   # 镜像由 GitHub Actions 自动构建并推送
   # ============================================================
   web:
-    image: ghcr.io/10000ge10000/epic-kiosk-web:latest
-    # 本地开发时取消注释下方两行：
-    # build:
-    #   context: .
+    build:
+      context: .
+    # image: ghcr.io/10000ge10000/epic-kiosk-web:latest
     container_name: epic-web
     ports:
       - "18000:8000"
