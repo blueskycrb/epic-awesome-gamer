@@ -124,20 +124,111 @@ def nuke_account_immediately(email):
         else:
             print(f"ℹ️ 路径不存在(无需补刀): {target_dir}")
 
+def is_verbose_traceback(line):
+    """
+    过滤掉冗长的 Python 堆栈跟踪行和 Playwright 调试信息
+    """
+    verbose_patterns = [
+        # rich 格式输出
+        line.startswith("│"),
+        line.startswith("└"),
+        line.startswith("├"),
+        # Python 追踪
+        line.startswith("File \""),
+        line.startswith("Traceback "),
+        line.startswith("asyncio.run"),
+        line.startswith("return await"),
+        line.startswith("return runner.run"),
+        line.startswith("return self."),
+        line.startswith("return call"),
+        line.startswith("raise "),
+        line.startswith("self._loop"),
+        line.startswith("self.run_forever"),
+        line.startswith("self._run_once"),
+        line.startswith("do = await"),
+        line.startswith("result = await"),
+        line.startswith("has_cart_items"),
+        line.startswith("await execute_browser_tasks"),
+        line.startswith("await agent.collect_epic_games"),
+        line.startswith("await self.epic_games"),
+        line.startswith("> File"),
+        # 对象表示
+        "<function " in line,
+        "<" in line and ">" in line and "object at" in line,
+        "AsyncRetrying" in line,
+        "RetryCallState" in line,
+        "RetryError" in line,
+        "Future at" in line,
+        "self._context.run" in line,
+        "handle._run()" in line,
+        # Playwright 调试信息
+        "locator resolved to" in line,
+        "attempting click action" in line,
+        "waiting for element" in line,
+        "element is not enabled" in line,
+        "retrying click action" in line,
+        line.startswith("- waiting"),
+        line.startswith("- element"),
+        line.startswith("- retrying"),
+        line.startswith("- locator"),
+        "waiting 20ms" in line,
+        "waiting 100ms" in line,
+        "waiting 500ms" in line,
+        "× waiting" in line,
+        line.startswith("Call log:"),
+        # hsw 脚本注入详细错误
+        "@debugger eval code" in line,
+        "eval code line" in line,
+        "evaluate@debugger" in line,
+    ]
+    return any(verbose_patterns)
+
+# 日志汉化映射
+LOG_TRANSLATIONS = {
+    "Wait for captcha response timeout": "验证码响应超时",
+    "Challenge success": "验证码通过",
+    "An error occurred while injecting hsw script": "脚本注入错误（可忽略）",
+    "is read-only": "（只读错误，已忽略）",
+    "invalid_account_credentials": "账号或密码错误",
+    "errors.com.epicgames.account.invalid_account_credentials": "账号或密码错误",
+    "errorCode": "错误码",
+    "errorMessage": "错误信息",
+}
+
+def translate_log(line):
+    """汉化关键日志消息"""
+    for en, zh in LOG_TRANSLATIONS.items():
+        if en in line:
+            # 对于特定错误，只保留汉化后的简短消息
+            if "is read-only" in line:
+                return "⚠️ 脚本注入警告（已忽略）"
+            if "@debugger" in line:
+                return None  # 完全过滤掉
+            if "errorCode" in line:
+                # 提取错误码
+                import re
+                match = re.search(r'"errorCode":\s*"([^"]+)"', line)
+                if match:
+                    code = match.group(1)
+                    if "invalid_account_credentials" in code:
+                        return "❌ 登录失败：账号或密码错误"
+                return line
+    return line
+
 def run_task(task_data):
     email = task_data.get("email")
     password = task_data.get("password")
-    mode = task_data.get("mode") 
-    
+    mode = task_data.get("mode")
+
     print(f"🚀 接到任务: {mode} - {email}")
     r.set(f"status:{email}", "🚀 初始化环境...", ex=3600)
-    
+
     env = os.environ.copy()
     env["EPIC_EMAIL"] = email
     env["EPIC_PASSWORD"] = password
-    env["ENABLE_APSCHEDULER"] = "false" 
-    
-    cmd = ["xvfb-run", "-a", "uv", "run", "app/deploy.py"]
+    env["ENABLE_APSCHEDULER"] = "false"
+
+    cmd = ["xvfb-run", "-a", "python3", "app/deploy.py"]
 
     is_login_success = False
     has_critical_error = False
@@ -146,27 +237,39 @@ def run_task(task_data):
 
     try:
         process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=env, text=True, bufsize=1
         )
 
         for line in process.stdout:
             line = line.strip()
             if not line: continue
+
+            # 过滤掉冗长的堆栈跟踪
+            if is_verbose_traceback(line):
+                continue
+
+            # 汉化关键日志
+            translated = translate_log(line)
+            if translated is None:
+                continue  # 完全过滤
+            if translated:
+                line = translated
+
             print(f"[{email}] {line}")
 
             # 🛑 致命错误 A: 无法获取 Cookie
             if "context cookies is not available" in line:
-                r.set(f"status:{email}", "❌ 登录失败：无效账号，已自动销毁", ex=300)
+                r.set(f"status:{email}", "❌ 登录失败：无效账号", ex=300)
                 r.set(f"result:{email}", "fail", ex=3600)
                 is_fatal_failure = True
                 process.kill()
-                nuke_account_immediately(email) 
+                nuke_account_immediately(email)
                 return
 
             # 🛑 致命错误 B: 密码错误
-            if "invalid_account_credentials" in line:
-                r.set(f"status:{email}", "❌ 密码错误：账号已自动销毁", ex=300)
+            if "invalid_account_credentials" in line or "账号或密码错误" in line:
+                r.set(f"status:{email}", "❌ 密码错误", ex=300)
                 r.set(f"result:{email}", "fail", ex=3600)
                 process.kill()
                 nuke_account_immediately(email)
@@ -175,18 +278,26 @@ def run_task(task_data):
             if "Could not find Place Order button" in line:
                 r.set(f"status:{email}", "⚠️ 找不到下单按钮", ex=3600)
                 has_critical_error = True
-            
+
             if "Timeout 30000ms exceeded" in line:
-                r.set(f"status:{email}", "⚠️ 网络超时，重试中...", ex=3600)
+                r.set(f"status:{email}", "⚠️ 操作超时，重试中...", ex=3600)
                 has_critical_error = True
+
+            # 验证码超时
+            if "captcha response timeout" in line.lower() or "验证码响应超时" in line:
+                r.set(f"status:{email}", "⚠️ 验证码超时，重试中...", ex=3600)
+
+            # 验证码成功
+            if "Challenge success" in line or "验证码通过" in line:
+                r.set(f"status:{email}", "✅ 验证码通过", ex=3600)
 
             if "Already in the library" in line:
                 is_already_owned = True
-                has_critical_error = False 
+                has_critical_error = False
                 r.set(f"status:{email}", "ℹ️ 游戏已在库中", ex=3600)
 
             if "Authentication completed" in line or "already logged in" in line:
-                r.set(f"status:{email}", "✅ 登录流程结束", ex=3600)
+                r.set(f"status:{email}", "✅ 登录成功", ex=3600)
                 is_login_success = True
 
             if '"title":' in line:
@@ -194,7 +305,7 @@ def run_task(task_data):
                     match = re.search(r'"title":\s*"([^"]+)"', line)
                     if match:
                         game_name = match.group(1)
-                        r.set(f"status:{email}", f"🎁 扫描到: {game_name}", ex=3600)
+                        r.set(f"status:{email}", f"🎁 发现: {game_name}", ex=3600)
                         r.set(f"pending_game:{email}", game_name, ex=3600)
                         scrape_and_download_image(game_name)
                 except: pass
@@ -203,21 +314,21 @@ def run_task(task_data):
                 if is_fatal_failure:
                     nuke_account_immediately(email)
                 elif has_critical_error and not is_already_owned:
-                    r.set(f"status:{email}", "❌ 任务异常结束 (超时/失败)", ex=3600)
+                    r.set(f"status:{email}", "❌ 任务异常结束", ex=3600)
                     r.set(f"result:{email}", "fail", ex=3600)
                 else:
                     pending_game = r.get(f"pending_game:{email}")
                     if pending_game:
                         report_success(email, pending_game)
                     if is_already_owned:
-                        r.set(f"status:{email}", "🎉 任务完成 (游戏已在库中)", ex=3600)
-                        r.set(f"result:{email}", "success_owned", ex=3600) 
+                        r.set(f"status:{email}", "✅ 任务完成（已在库中）", ex=3600)
+                        r.set(f"result:{email}", "success_owned", ex=3600)
                     else:
-                        r.set(f"status:{email}", "🎉 成功领取新游戏！", ex=3600)
+                        r.set(f"status:{email}", "🎉 领取成功！", ex=3600)
                         r.set(f"result:{email}", "success_new", ex=3600)
 
         process.wait()
-        
+
         # 正常结束，执行常规瘦身
         clean_user_profile(email)
 

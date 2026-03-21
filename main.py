@@ -4,6 +4,8 @@ import sqlite3
 import redis
 import shutil
 import random
+import httpx
+import re
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -57,29 +59,43 @@ class GameLog(BaseModel):
     game_title: str
     image_filename: str
 
-# --- 🛡️ 防滥用中间件 (新增) ---
+# --- 🛡️ 防滥用中间件 (多层防护) ---
 @app.middleware("http")
 async def anti_abuse_middleware(request: Request, call_next):
-    # 仅针对“提交任务/启动引擎”接口进行限制
+    # 仅针对"提交任务/启动引擎"接口进行限制
     if request.url.path == "/api/deposit" and request.method == "POST":
         client_ip = request.client.host
-        
-        # 1. 检查是否已被永久封禁
-        if r.exists(f"ban:{client_ip}"):
-            return JSONResponse(status_code=403, content={"status": "banned", "msg": "🚫 此 IP 已因滥用被永久封禁，请联系管理员。"})
-        
-        # 2. 频率计数 (Key: rate:IP, 有效期: 1小时)
-        limit_key = f"rate:{client_ip}"
-        current_count = r.incr(limit_key)
-        
-        # 如果是第一次请求，设置 1 小时过期时间
+
+        # 1. 检查是否被永久封禁（恶意IP）
+        perm_ban_key = f"perm_ban:{client_ip}"
+        if r.exists(perm_ban_key):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "banned", "msg": "🚫 此 IP 因滥用已被永久封禁"}
+            )
+
+        # 2. 检查是否在临时封禁中（1小时）
+        temp_ban_key = f"temp_ban:{client_ip}"
+        ban_ttl = r.ttl(temp_ban_key)
+        if ban_ttl > 0:
+            mins = ban_ttl // 60
+            return JSONResponse(
+                status_code=429,
+                content={"status": "rate_limited", "msg": f"⏳ 操作过于频繁，请 {mins} 分钟后重试"}
+            )
+
+        # 3. 限流：1分钟内最多3次
+        rate_key = f"rate:{client_ip}"
+        current_count = r.incr(rate_key)
         if current_count == 1:
-            r.expire(limit_key, 3600)
-        
-        # 3. 超过 5 次，执行永久封禁
-        if current_count > 5:
-            r.set(f"ban:{client_ip}", "1") # 永久Key，不设过期时间
-            return JSONResponse(status_code=403, content={"status": "banned", "msg": "🚫 操作过于频繁(>5次/小时)，IP 已被永久封禁。"})
+            r.expire(rate_key, 60)
+
+        if current_count > 3:
+            r.setex(temp_ban_key, 3600, "1")  # 1小时临时封禁
+            return JSONResponse(
+                status_code=429,
+                content={"status": "rate_limited", "msg": "⏳ 操作过于频繁，请 1 小时后重试"}
+            )
 
     response = await call_next(request)
     return response
@@ -122,12 +138,54 @@ async def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/api/deposit")
-async def deposit(account: Account):
-    task = {"email": account.email, "password": account.password, "mode": "verify"}
-    r.delete(f"status:{account.email}")
-    r.delete(f"result:{account.email}")
+async def deposit(account: Account, request: Request):
+    """
+    提交任务接口
+
+    安全机制：
+    1. 检查是否有正在执行的任务
+    2. 验证已存储账号的密码（防止恶意覆盖）
+    3. 记录 IP 提交的账号数量（防止恶意刷量）
+    """
+    email = account.email
+    password = account.password
+    client_ip = request.client.host
+
+    # 1. 检查是否正在处理中
+    current_status = r.get(f"status:{email}")
+    if current_status and not current_status.startswith("🎉") and not current_status.startswith("❌"):
+        return {"status": "busy", "msg": "⏳ 该账号有任务正在执行中，请稍后再试"}
+
+    # 2. 如果是已存储账号，验证密码
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT password FROM accounts WHERE email=?", (email,))
+    row = c.fetchone()
+    conn.close()
+
+    if row and row[0] != password:
+        return {"status": "auth_failed", "msg": "❌ 密码错误，无法操作此账号"}
+
+    # 3. 记录 IP 提交的账号（用于检测恶意刷量）
+    ip_accounts_key = f"ip_accounts:{client_ip}"
+    ip_accounts = r.smembers(ip_accounts_key)
+
+    if email not in ip_accounts:
+        # 新账号
+        r.sadd(ip_accounts_key, email)
+        r.expire(ip_accounts_key, 86400 * 7)  # 7天过期
+
+        # 如果同一IP提交超过5个不同账号，永久封禁
+        if len(ip_accounts) >= 5:
+            r.set(f"perm_ban:{client_ip}", "1")  # 永久封禁
+            return {"status": "banned", "msg": "🚫 检测到异常行为，此 IP 已被封禁"}
+
+    # 3. 提交任务
+    task = {"email": email, "password": password, "mode": "verify"}
+    r.delete(f"status:{email}")
+    r.delete(f"result:{email}")
     r.rpush("task_queue", json.dumps(task))
-    return {"status": "queued", "msg": "正在加入队列..."}
+    return {"status": "queued", "msg": "✅ 任务已加入队列"}
 
 @app.post("/api/delete_account")
 async def delete_account(account: Account):
@@ -226,3 +284,132 @@ def daily_job():
 scheduler = AsyncIOScheduler()
 scheduler.add_job(daily_job, 'cron', hour=12, minute=0)
 scheduler.start()
+
+# --- 📊 系统状态与免费游戏 API ---
+
+@app.get("/api/system_stats")
+async def get_system_stats():
+    """
+    获取系统统计数据：
+    - 托管账号总数
+    - 今日领取数量
+    - 累计领取数量
+    - 系统运行时间
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # 托管账号总数
+    c.execute("SELECT COUNT(*) FROM accounts")
+    total_accounts = c.fetchone()[0]
+
+    # 今日领取数量
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT COUNT(*) FROM logs WHERE claim_time LIKE ?", (f"{today}%",))
+    today_claims = c.fetchone()[0]
+
+    # 累计领取数量
+    c.execute("SELECT COUNT(*) FROM logs")
+    total_claims = c.fetchone()[0]
+
+    conn.close()
+
+    # 队列中等待的任务数
+    queue_length = r.llen("task_queue")
+
+    return {
+        "total_accounts": total_accounts,
+        "today_claims": today_claims,
+        "total_claims": total_claims,
+        "queue_length": queue_length,
+        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+@app.get("/api/free_games")
+async def get_free_games():
+    """
+    从 Epic Games API 获取当前免费游戏列表
+    缓存 1 小时，避免频繁请求
+    """
+    cache_key = "cache:free_games"
+    cached = r.get(cache_key)
+
+    if cached:
+        return {"status": "success", "data": json.loads(cached), "cached": True}
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            # 直接使用 Epic 官方 API
+            api_url = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            }
+            resp = await client.get(api_url, headers=headers)
+            data = resp.json()
+
+            games = []
+            elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
+
+            for item in elements:
+                promotions = item.get("promotions")
+                if not promotions:
+                    continue
+
+                current_promos = promotions.get("promotionalOffers", [])
+
+                # 检查是否有当前免费促销
+                is_free_now = False
+                for promo_group in current_promos:
+                    for promo in promo_group.get("promotionalOffers", []):
+                        discount_setting = promo.get("discountSetting", {})
+                        if discount_setting.get("discountType") == "PERCENTAGE" and discount_setting.get("discountPercentage") == 0:
+                            is_free_now = True
+                            break
+                    if is_free_now:
+                        break
+
+                if is_free_now:
+                    # 获取图片
+                    image_url = ""
+                    for img in item.get("keyImages", []):
+                        if img.get("type") in ["OfferImageWide", "DieselStoreFrontWide", "Thumbnail", "OfferImageTall"]:
+                            image_url = img.get("url", "")
+                            break
+
+                    # 获取游戏 slug
+                    product_slug = item.get("productSlug", "") or item.get("urlSlug", "")
+                    if item.get("offerMappings"):
+                        for mapping in item["offerMappings"]:
+                            if mapping.get("pageSlug"):
+                                product_slug = mapping["pageSlug"]
+                                break
+
+                    games.append({
+                        "title": item.get("title", "未知游戏"),
+                        "slug": product_slug,
+                        "image": image_url,
+                        "url": f"https://store.epicgames.com/zh-CN/p/{product_slug}" if product_slug else "https://store.epicgames.com/zh-CN/free-games",
+                        "original_price": item.get("price", {}).get("totalPrice", {}).get("fmtPrice", {}).get("originalPrice", "免费"),
+                        "description": (item.get("description") or "")[:100]
+                    })
+
+            # 缓存 1 小时
+            r.setex(cache_key, 3600, json.dumps(games))
+
+            return {"status": "success", "data": games, "cached": False}
+
+    except Exception as e:
+        print(f"获取免费游戏失败: {e}")
+        # 返回引导用户访问官网的数据
+        fallback_games = [
+            {
+                "title": "查看本周免费游戏",
+                "slug": "",
+                "image": "",
+                "url": "https://store.epicgames.com/zh-CN/free-games",
+                "original_price": "免费",
+                "description": "点击前往 Epic 官网查看本周免费游戏"
+            }
+        ]
+        return {"status": "fallback", "data": fallback_games, "error": str(e)}

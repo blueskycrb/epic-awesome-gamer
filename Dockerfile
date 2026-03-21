@@ -3,7 +3,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    fastapi uvicorn redis apscheduler aiofiles python-multipart jinja2
+    fastapi uvicorn redis apscheduler aiofiles python-multipart jinja2 httpx
 
 COPY . .
 

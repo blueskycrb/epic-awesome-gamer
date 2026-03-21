@@ -1,48 +1,113 @@
-version: '3.8'
+# ============================================================
+# Epic Kiosk - 自动驾驶领取系统
+# ============================================================
+# 公益站点: https://epic.910501.xyz/
+# GitHub: https://github.com/10000ge10000/epic-awesome-gamer
+# ============================================================
+#
+# 🚀 部署方式：
+#   1. 一键脚本: curl -fsSL https://raw.githubusercontent.com/10000ge10000/epic-awesome-gamer/Epic-Autopilot/install.sh | bash
+#   2. 手动部署: 修改 API Key 后执行 docker compose up -d
+#
+# ⚠️ 必须修改: SILICONFLOW_API_KEY
+#    获取地址: https://cloud.siliconflow.cn/i/OVI2n57p
+#
+# 📦 镜像说明：
+#   - redis:alpine - 官方镜像，直接拉取
+#   - ghcr.io/...-worker - GitHub Actions 自动构建
+#   - ghcr.io/...-web - GitHub Actions 自动构建
+# ============================================================
 
 services:
+  # ============================================================
+  # Redis: 消息队列（官方镜像）
+  # ============================================================
   redis:
     image: redis:alpine
     container_name: epic-redis
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  # ============================================================
+  # Web: 前端服务（FastAPI）
+  # 镜像由 GitHub Actions 自动构建并推送
+  # ============================================================
   web:
-    build: .
+    image: ghcr.io/10000ge10000/epic-awesome-gamer-web:latest
+    # 本地开发时取消注释下方两行：
+    # build:
+    #   context: .
     container_name: epic-web
     ports:
       - "18000:8000"
     volumes:
-      # 统一挂载 data 目录，图片存在 ./data/images 下
       - ./data:/app/data
     environment:
       - REDIS_HOST=redis
       - TZ=Asia/Shanghai
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  # ============================================================
+  # Worker: 后台任务执行器（浏览器自动化）
+  # 镜像由 GitHub Actions 自动构建并推送
+  # ============================================================
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
+    image: ghcr.io/10000ge10000/epic-awesome-gamer-worker:latest
+    # 本地开发时取消注释下方两行：
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.worker
     container_name: epic-worker
     user: root
     volumes:
-      # 这里的映射是为了持久化 Cookie
-      - ./data:/app/app/volumes 
-      # ⚠️ 新增：为了让 Worker 把图片保存到宿主机，Web 也能读到
       - ./data:/app/data
-      - ./worker.py:/app/worker.py
+      - ./data:/app/app/volumes
     environment:
       - REDIS_HOST=redis
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
-      # ⚠️ ⚠️ ⚠️ 修改GEMINI_API_KEY值：为你自己申请到的
-      - GEMINI_API_KEY=sk-xxx
-      - GEMINI_BASE_URL=https://aihubmix.com
-      - GEMINI_MODEL=gemini-2.5-pro
       - ENABLE_APSCHEDULER=false
-    command: ["python3", "/app/worker.py"]
+      - API_PROVIDER=siliconflow
+      - SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+      # ============================================================
+      # ⚠️⚠️⚠️ 必须修改下方 API Key ⚠️⚠️⚠️
+      # ============================================================
+      # 获取步骤：
+      # 1. 访问邀请链接: https://cloud.siliconflow.cn/i/OVI2n57p
+      # 2. 注册账号并完成实名认证
+      # 3. 双方各得 ¥16 代金券（可领 1500+ 次任务）
+      # 4. 在控制台创建 API Key，替换下方的 sk-xxx
+      # ============================================================
+      - SILICONFLOW_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      # ============================================================
+      # 模型配置（已优化，无需修改）
+      - CAPTCHA_MODEL=Qwen/Qwen2.5-VL-32B-Instruct
+      - CAPTCHA_MODEL_FALLBACK=Qwen/Qwen2.5-VL-72B-Instruct
+      - PRIMARY_MODEL=Qwen/Qwen2.5-7B-Instruct
+      - PRIMARY_MODEL_FALLBACK=Qwen/Qwen2.5-72B-Instruct
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
